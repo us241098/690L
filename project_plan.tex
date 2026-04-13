@@ -55,70 +55,78 @@
 \maketitle
 
 \begin{abstract}
-This document presents the literature review and detailed project design for our study on task-specific reasoning behavior in large language models (LLMs). We survey the existing literature on chain-of-thought reasoning, overthinking phenomena, budget forcing techniques, test-time compute scaling laws, and task-specific reasoning differences. Based on this review, we present a concrete experimental design: using four model sizes from the Qwen3.5 family (0.8B, 4B, 9B, 27B), we will systematically evaluate seven diverse benchmarks under seven reasoning token budget levels (0 to 8192 tokens) using a budget forcing strategy. The goal is to characterize the accuracy--reasoning token relationship across task types and model sizes, providing practical guidance for reasoning budget allocation in LLM-based workflows.
+This document presents the literature review and detailed project design for our study on task-specific reasoning behavior in large language models (LLMs). We survey the existing literature on chain-of-thought reasoning, overthinking phenomena, budget forcing techniques, test-time compute scaling laws, task-specific reasoning differences, and the rapidly emerging field of agentic and compound AI systems. Based on this review, we present a concrete experimental design: using four model sizes from the Qwen3.5 family (0.8B, 4B, 9B, 27B), we systematically evaluate seven diverse benchmarks under seven reasoning token budget levels (0 to 8192 tokens) using a budget forcing strategy. We explicitly map each experimental output to one of four research questions (RQ1--RQ4), and dedicate a full analysis section to RQ4 by deriving five concrete deliverables that translate empirical accuracy--reasoning curves into actionable workflow design guidance: a budget recommendation table, a simulated multi-node workflow case study, a Pareto frontier analysis, decision heuristics, and per-task reasoning elasticity scaling laws.
 \end{abstract}
 
 % ============================================================
 \section{Literature Review}
 % ============================================================
 
-We organize the related literature into five thematic areas that inform our study.
+We organize the related literature into eight thematic areas that inform our study.
 
 % ------------------------------------------------------------
 \subsection{Chain-of-Thought and Thinking Modes}
 % ------------------------------------------------------------
 
-Chain-of-thought (CoT) prompting, introduced by \citet{wei2022chain}, demonstrated that providing intermediate reasoning steps as exemplars dramatically improves LLM performance on arithmetic, commonsense, and symbolic reasoning tasks. Crucially, these benefits emerge only at sufficient model scale. \citet{kojima2022large} further showed that zero-shot CoT---simply appending ``Let's think step by step''---yields similar improvements without exemplars, suggesting that LLMs have latent reasoning capabilities that can be triggered with minimal prompting. \citet{wang2023self} proposed self-consistency, sampling diverse reasoning paths and selecting the most consistent answer via majority voting, achieving +17.9\% on GSM8K over greedy CoT.
+Chain-of-thought (CoT) prompting, introduced by \citet{wei2022chain}, demonstrated that providing intermediate reasoning steps as exemplars dramatically improves LLM performance on arithmetic, commonsense, and symbolic reasoning tasks. Crucially, these benefits emerge only at sufficient model scale. \citet{kojima2022large} further showed that zero-shot CoT---simply appending ``Let's think step by step''---yields similar improvements without exemplars, suggesting that LLMs have latent reasoning capabilities that can be triggered with minimal prompting. \citet{wang2023self} proposed self-consistency, sampling diverse reasoning paths and selecting the most consistent answer via majority voting, achieving +17.9\% on GSM8K over greedy CoT. \citet{wang2024cotwithout} provide mechanistic insight: LLMs already contain latent CoT reasoning paths in their top-$k$ decoded outputs, and these paths lead to correct answers more frequently than greedy decoding---suggesting that explicit thinking budgets surface capabilities the model already has.
 
-More recently, a new paradigm has emerged: \emph{native thinking modes}, where models are trained via reinforcement learning to generate internal reasoning traces. OpenAI's o1 \citep{openai2024reasoning} achieves 89th percentile on Codeforces and top-500 on AIME through RL-trained chain-of-thought. DeepSeek-R1 \citep{deepseek2025r1} demonstrates that pure RL without supervised fine-tuning on reasoning traces can incentivize reasoning capabilities, with self-reflection and verification emerging naturally. The Qwen3 family \citep{yang2025qwen3} introduces a hybrid thinking/non-thinking architecture within a single model using \texttt{<think>} tags, controlled via the \texttt{enable\_thinking} parameter. This hybrid design is directly relevant to our study, as it enables fine-grained control over reasoning behavior.
-
-\citet{meincke2025decreasing} find that explicit CoT prompting provides diminishing returns as models become more capable, since modern reasoning models already engage in step-by-step reasoning without being asked.
+A new paradigm has recently emerged: \emph{native thinking modes}, where models are trained via reinforcement learning to generate internal reasoning traces. OpenAI's o1 \citep{openai2024reasoning} achieves 89th percentile on Codeforces and top-500 on AIME through RL-trained chain-of-thought. \citet{deepseek2025r1} (DeepSeek-R1) demonstrate that pure RL without supervised fine-tuning on reasoning traces can incentivize reasoning capabilities, with self-reflection and verification emerging naturally. \citet{kimi2025k15} (Kimi K1.5) introduce a long-to-short technique that transfers reasoning capabilities from long-CoT to short-CoT models, directly relevant to our budget forcing methodology. Microsoft's Phi-4-reasoning \citep{microsoft2025phi4} demonstrates that smaller models (14B) can achieve strong reasoning with appropriate SFT+RL training, supporting our model-size scaling analysis. The Qwen3 family \citep{yang2025qwen3} introduces a hybrid thinking/non-thinking architecture within a single model using \texttt{<think>} tags, controlled via the \texttt{enable\_thinking} parameter and a \texttt{thinking\_budget} control. This hybrid design is directly relevant to our study, as it enables fine-grained control over reasoning behavior. \citet{meincke2025decreasing} find that explicit CoT prompting provides diminishing returns as models become more capable.
 
 % ------------------------------------------------------------
 \subsection{Overthinking: When Reasoning Hurts}
 % ------------------------------------------------------------
 
-While reasoning is generally assumed to improve performance, a growing body of work demonstrates that excessive reasoning can be counterproductive. \citet{aggarwal2025optimal} introduce OptimalThinkingBench, comprising OverthinkingBench (simple queries) and UnderthinkingBench (challenging reasoning tasks), finding that independently optimizing for one metric degrades the other. \citet{su2025between} provide a systematic empirical study revealing a non-monotonic \emph{inverted-U} relationship between reasoning length and accuracy: performance improves up to a point, then declines with further reasoning. Critically, they find that LLMs tend to overthink simple problems and underthink harder ones.
-
-\citet{hassid2025dont} demonstrate that shorter reasoning chains are up to 34.5\% more likely to yield correct answers than the longest chain, proposing \emph{short-m@k}: generating $k$ reasoning paths in parallel, stopping when the first $m$ complete, and majority voting among them. This achieves similar or superior performance using up to 40\% fewer thinking tokens.
-
-\citet{yang2025mirage} present an empirical study showing initial performance improvements from extended thinking followed by decline, proposing a probabilistic model that reveals additional thinking increases output variance, creating an ``illusion of improved reasoning.'' They find that parallel thinking (multiple independent paths with majority vote) achieves up to 20\% higher accuracy than extended serial thinking.
-
-\citet{zhang2025structural} identify two structural overthinking patterns: the \emph{Explorer} (excessive exploration of solution paths) and \emph{Late Landing} (excessive verification of already-correct solutions), finding that long-thinking models are 5--20$\times$ slower on simple tasks with no accuracy gains. \citet{sui2025stop} provide the first comprehensive survey on efficient reasoning, documenting the overthinking phenomenon systematically and noting that it is economically significant (OpenAI o1 costs \$60/1M generated tokens).
+While reasoning is generally assumed to improve performance, a growing body of work demonstrates that excessive reasoning can be counterproductive. \citet{aggarwal2025optimal} introduce OptimalThinkingBench, finding that independently optimizing for one metric degrades the other. \citet{su2025between} reveal a non-monotonic \emph{inverted-U} relationship between reasoning length and accuracy: performance improves up to a point, then declines. \citet{hassid2025dont} demonstrate that shorter reasoning chains are up to 34.5\% more likely to yield correct answers than the longest chain. \citet{yang2025mirage} show that extended thinking increases output variance, creating an ``illusion of improved reasoning,'' and that parallel thinking outperforms extended serial thinking by up to 20\%. \citet{zhang2025structural} identify two structural overthinking patterns: the \emph{Explorer} (excessive exploration) and \emph{Late Landing} (excessive verification), finding that long-thinking models are 5--20$\times$ slower on simple tasks with no accuracy gains. \citet{wang2025nowait} show that suppressing self-reflection tokens (``Wait'', ``Hmm'') reduces CoT length by 27--51\% without compromising accuracy. \citet{sui2025stop} provide the first comprehensive survey of efficient reasoning.
 
 % ------------------------------------------------------------
 \subsection{Budget Forcing and Reasoning Control}
 % ------------------------------------------------------------
 
-The question of how to \emph{control} reasoning token budgets has attracted significant attention. \citet{muennighoff2025s1} introduce the seminal \emph{budget forcing} strategy: forcefully terminating the thinking process at a predefined token threshold, or extending it by appending ``Wait'' tokens. After supervised fine-tuning on a curated 1,000-question dataset, their s1-32B model exceeds o1-preview on competition mathematics by up to 27\%. Budget forcing enables extrapolating beyond uncontrolled performance, making it the foundation for our experimental methodology.
-
-\citet{aggarwal2025l1} propose Length Controlled Policy Optimization (LCPO), an RL method that optimizes for both accuracy and adherence to user-specified length constraints, outperforming s1's hard truncation with smoother control. \citet{li2025steering} present a fine-tuning-free approach using a lightweight predictor that models a Gamma distribution over remaining thinking length, steering generation at the token level. Under tight budgets, this significantly outperforms budget forcing. \citet{han2025token} propose the TALE framework, achieving 67\% output token cost reduction with competitive accuracy by dynamically adjusting reasoning tokens based on problem complexity.
-
-On the commercial side, both OpenAI (via the \texttt{reasoning\_effort} parameter) and Anthropic (via the \texttt{budget\_tokens} parameter for Claude's extended thinking) have implemented API-level reasoning budget control, demonstrating industry adoption of this concept.
+\citet{muennighoff2025s1} introduce the seminal \emph{budget forcing} strategy: forcefully terminating the thinking process at a predefined token threshold, or extending it by appending ``Wait'' tokens. After SFT on a curated 1,000-question dataset, their s1-32B model exceeds o1-preview on competition mathematics by up to 27\%. This is the methodological foundation for our work. \citet{aggarwal2025l1} propose Length Controlled Policy Optimization (LCPO), an RL method that outperforms s1's hard truncation. \citet{li2025steering} present a fine-tuning-free approach using a Gamma distribution over remaining thinking length. \citet{han2025token} propose TALE, achieving 67\% output token cost reduction. \citet{wen2025budgetthinker} (BudgetThinker) periodically inserts control tokens to inform the model of remaining budget. On the commercial side, both OpenAI (\texttt{reasoning\_effort}) and Anthropic (\texttt{budget\_tokens}) have implemented API-level reasoning budget control, demonstrating industry adoption.
 
 % ------------------------------------------------------------
 \subsection{Test-Time Compute Scaling Laws}
 % ------------------------------------------------------------
 
-\citet{snell2024scaling} establish the foundational result that allocating more computation at inference time can be more efficient than scaling model parameters, with important implications for the pretraining-vs-inference compute tradeoff. \citet{yang2025tops} propose Thinking-Optimal Scaling (TOPS), revealing that scaling with longer CoTs can \emph{impair} reasoning in certain domains, and that there exists an optimal length distribution that differs across domains. This directly supports our thesis that optimal reasoning compute is task-specific.
-
-\citet{yeo2025demystifying} study how inference compute scaling enhances reasoning, showing that SFT simplifies training but is not strictly necessary, and that error correction is inherent in base models but difficult to incentivize via RL for complex tasks. A large-scale study spanning 30B+ generated tokens across 8 open-source models \citep{artofscaling2025} finds that no single test-time scaling strategy universally dominates, and reasoning models exhibit distinct ``short-horizon'' vs.\ ``long-horizon'' trace-quality patterns.
+\citet{snell2024scaling} establish the foundational result that allocating more computation at inference time can be more efficient than scaling model parameters, and importantly, that compute-optimal scaling should be \emph{adaptive per prompt}. \citet{bansal2024empirical} provide a complementary empirical analysis showing the optimal inference strategy depends heavily on problem difficulty. \citet{yang2025tops} (TOPS) reveal that scaling with longer CoTs can \emph{impair} reasoning in certain domains, supporting our task-specific thesis. \citet{yeo2025demystifying} study how inference compute scaling enhances reasoning. The large-scale study by \citet{artofscaling2025} spanning 30B+ generated tokens across 8 open-source models finds that no single test-time scaling strategy universally dominates.
 
 % ------------------------------------------------------------
 \subsection{Task-Specific Reasoning Differences}
 % ------------------------------------------------------------
 
-Several works have begun to investigate task-specific reasoning behavior. \citet{marjanovic2025thoughtology} systematically analyze DeepSeek-R1's reasoning patterns, discovering a ``sweet spot'' of reasoning length for each problem type---an optimal range where performance is highest, with longer chains showing substantially lower accuracy. This is the most directly related work to our study, though it examines only a single model size (DeepSeek-R1) and does not use explicit budget forcing.
+\citet{marjanovic2025thoughtology} systematically analyze DeepSeek-R1's reasoning patterns, discovering a ``sweet spot'' of reasoning length for each problem type---an optimal range where performance is highest. This is the most directly related work to our study, though it examines only a single model size and does not use explicit budget forcing. \citet{zhao2025knowledge} evaluate 12 reasoning models on knowledge-intensive benchmarks, finding that increasing test-time computation does \emph{not} consistently improve accuracy and can increase hallucinations. \citet{liu2025diffadapt} observe a U-shaped entropy pattern across problem difficulties, finding that 82.3\% of problems benefit from an ``Easy'' strategy. \citet{alomrani2025reasoning} provide a comprehensive survey introducing the L1-controllability vs.\ L2-adaptiveness taxonomy.
 
-\citet{zhao2025knowledge} evaluate 12 reasoning models on knowledge-intensive benchmarks, finding that increasing test-time computation does \emph{not} consistently improve accuracy for knowledge tasks, and in many cases leads to more hallucinations. This demonstrates that reasoning scaling benefits are not universal across task types. \citet{liu2025diffadapt} observe a U-shaped entropy pattern across problem difficulties, finding that 82.3\% of problems benefit from an ``Easy'' strategy, confirming that task difficulty demands fundamentally different reasoning approaches.
+Two important critical perspectives frame our interpretation. \citet{mirzadeh2024gsmsymbolic} (Apple's GSM-Symbolic) demonstrate that LLM math performance drops up to 65\% on symbolic variations of GSM8K problems, raising the question of whether reasoning tokens genuinely improve reasoning or merely enable better pattern completion. \citet{kambhampati2024reason} argues that LLM ``reasoning'' is approximate retrieval rather than genuine reasoning. Our budget forcing experiments cannot fully resolve this debate, but our cross-task curves contribute empirical evidence on which tasks benefit from extended computation.
 
-\citet{alomrani2025reasoning} provide a comprehensive survey introducing a two-tiered taxonomy: \emph{L1-controllability} (fixed compute budgets) and \emph{L2-adaptiveness} (dynamic scaling based on input difficulty), documenting systemic inefficiencies including underthinking on hard problems, overthinking on simple ones, and limited sensitivity to task complexity.
+% ------------------------------------------------------------
+\subsection{Reasoning Evaluation, Verification, and Self-Correction}
+% ------------------------------------------------------------
+
+Reasoning quality has been studied through process supervision and self-correction lenses. \citet{lightman2023verify} introduce process reward models (PRMs) trained on PRM800K, showing process supervision significantly outperforms outcome supervision for math reasoning. \citet{wang2024mathshepherd} (Math-Shepherd) propose automatic process reward training without human annotations. \citet{madaan2023selfrefine} (Self-Refine) demonstrate that iterative self-refinement yields 5--40\% improvement, an analog of within-trace self-correction enabled by extended thinking budgets. \citet{shinn2023reflexion} (Reflexion) propose verbal self-reflection as a form of RL signal, achieving 91\% pass@1 on HumanEval. \citet{suzgun2023bbh} introduce BIG-Bench Hard, and \citet{rein2023gpqa} introduce GPQA---both standard benchmarks for evaluating expert reasoning. For multimodal reasoning, \citet{xu2024llavacot} (LLaVA-CoT) demonstrate structured stage-wise reasoning produces significant gains on MathVista.
+
+% ------------------------------------------------------------
+\subsection{Agentic Workflows and Compound AI Systems}
+% ------------------------------------------------------------
+
+The motivation for RQ4 is grounded in the rapid shift toward compound AI systems. \citet{zaharia2024compound} argue at the BAIR blog that SOTA AI results increasingly come from compound systems---multiple LLM calls, retrievers, and tools---rather than monolithic models, and that ``scaling [model parameters] offers lower returns-vs-cost than building a compound system.'' \citet{khattab2023dspy} introduce DSPy, which compiles declarative LLM pipelines as computational graphs with per-module optimization. \citet{wu2023autogen} (AutoGen) and \citet{fourney2024magentic} (Magentic-One) demonstrate multi-agent frameworks where different agents naturally use different models and reasoning depths. Industry guidance from Anthropic (``Building Effective Agents'') and OpenAI (``A Practical Guide to Building Agents'') explicitly recommends per-node routing of easy queries to small models and hard queries to capable models, with OpenAI specifically calling out tuning the \texttt{reasoning\_effort} parameter per node.
+
+\citet{chen2025llmselector} (LLMSelector) is the most directly relevant prior work to our RQ4: per-module model selection in compound systems yields 5--70\% accuracy gains over uniform model selection. Our work parallels this for reasoning \emph{budget} allocation rather than model selection. Routing approaches---\citet{ong2024routellm} (RouteLLM), \citet{chen2023frugalgpt} (FrugalGPT), \citet{ding2024hybrid} (Hybrid LLM)---all dynamically select between models based on query characteristics, reducing cost by 40--98\%. \citet{su2025daao} (DAAO) extends this to multi-agent systems with VAE-based difficulty estimation, achieving 11\% accuracy improvement and 36\% cost reduction.
+
+Adaptive thinking---deciding \emph{whether} to think---has also emerged as a research direction. \citet{zhang2025adaptthink} (AdaptThink) trains models to adaptively select Thinking vs.\ NoThinking, achieving 53\% length reduction with 2.4\% accuracy improvement. \citet{lou2025adacot} (AdaCoT) uses PPO to learn CoT triggering, achieving 69\% token reduction. \citet{damani2024learning} demonstrate learnable input-adaptive computation allocation, achieving 50\% compute reduction. \citet{paglieri2025whentoplan} formalize when LLM agents should allocate compute for planning, finding always-planning is costly while never-planning limits capability.
+
+Foundational decomposition methods including \citet{yao2022react} (ReAct), \citet{yao2023tot} (Tree of Thoughts), and \citet{wang2024moa} (Mixture-of-Agents) illustrate how multi-step pipelines naturally create heterogeneous nodes with different reasoning requirements. The systems perspective from \citet{kim2026hpca} reveals that per-query energy in agentic workflows can be orders of magnitude higher than single-turn inference, making reasoning budget optimization essential.
+
+% ------------------------------------------------------------
+\subsection{Benchmark Source Papers}
+% ------------------------------------------------------------
+
+We use the following benchmarks: GSM8K \citep{cobbe2021gsm8k}, MATH \citep{hendrycks2021math}, MMLU-Pro \citep{wang2024mmlupro}, HumanEval \citep{chen2021humaneval}, IFEval \citep{zhou2023ifeval}, and MathVista \citep{lu2024mathvista}.
 
 % ------------------------------------------------------------
 \subsection{Gap and Contribution}
 % ------------------------------------------------------------
 
-While the literature establishes that (a) reasoning is not universally beneficial, (b) budget forcing can control reasoning compute, and (c) different tasks may have different optimal reasoning strategies, \textbf{no existing work has performed a systematic cross-task analysis at varying reasoning budgets using models of multiple sizes from the same family}. The Thoughtology paper \citep{marjanovic2025thoughtology} comes closest but studies only DeepSeek-R1 (a single model size) without explicit budget forcing. Our work fills this gap by using the Qwen3.5 family (0.8B to 27B) with budget forcing across seven diverse benchmarks, enabling a controlled study of how reasoning token budgets interact with task type and model scale.
+While the literature establishes that (a) reasoning is not universally beneficial, (b) budget forcing can control reasoning compute, (c) different tasks may have different optimal reasoning strategies, and (d) compound AI systems would benefit from per-node optimization, \textbf{no existing work has performed a systematic cross-task analysis at varying reasoning budgets using models of multiple sizes from the same family, with explicit translation to workflow-level allocation guidance.} Thoughtology \citep{marjanovic2025thoughtology} studies a single model without budget forcing. LLMSelector \citep{chen2025llmselector} does per-node \emph{model} selection, not budget allocation. Our work fills this gap by combining all three axes (task type $\times$ model size $\times$ reasoning budget) and producing concrete workflow design guidance through five RQ4 deliverables (\S\ref{sec:rq4}).
 
 % ============================================================
 \section{Experimental Design}
@@ -128,7 +136,7 @@ While the literature establishes that (a) reasoning is not universally beneficia
 \subsection{Models}
 % ------------------------------------------------------------
 
-We use four models from the Qwen3.5 family \citep{yang2025qwen3}, selected to span a wide range of model capacities while remaining feasible on a single NVIDIA H100 80GB GPU:
+We use four models from the Qwen3.5 family \citep{yang2025qwen3}, selected to span a wide range of model capacities while remaining feasible on a single NVIDIA H100 80GB GPU.
 
 \begin{table}[h]
 \centering
@@ -146,72 +154,56 @@ Qwen3.5-27B & FP8 & $\sim$32 GB & Largest feasible on single H100 \\
 \end{tabular}
 \end{table}
 
-All Qwen3.5 models implement thinking via \texttt{<think>...</think>} tags and support vision inputs natively (unified multimodal architecture). The FP8 quantization for the 27B model leverages the H100's native FP8 Tensor Core support with negligible quality loss.
-
 % ------------------------------------------------------------
 \subsection{Benchmarks}
 % ------------------------------------------------------------
 
-We select seven benchmarks covering diverse cognitive requirements, enabling a comprehensive analysis of task-specific reasoning behavior:
+We select seven benchmarks covering diverse cognitive requirements:
 
 \begin{table}[h]
 \centering
-\caption{Benchmark selection. Subset sizes are chosen to balance statistical reliability with computational feasibility.}
+\caption{Benchmark selection.}
 \label{tab:benchmarks}
 \small
-\begin{tabular}{@{}p{2.2cm}p{2cm}p{3.2cm}cp{2.5cm}@{}}
+\begin{tabular}{@{}p{2.0cm}p{1.6cm}p{2.8cm}cp{2.2cm}p{2.5cm}@{}}
 \toprule
-\textbf{Category} & \textbf{Benchmark} & \textbf{Source} & \textbf{Size} & \textbf{Metric} \\
+\textbf{Category} & \textbf{Benchmark} & \textbf{Source} & \textbf{Size} & \textbf{Metric} & \textbf{Original} \\
 \midrule
-Math (easy) & GSM8K & \texttt{openai/gsm8k} & 500 & Exact match \\
-Math (hard) & MATH-500 & \texttt{HuggingFaceH4/MATH-500} & 500 & Exact match \\
-Knowledge QA & MMLU-Pro & \texttt{TIGER-Lab/MMLU-Pro} & 500 & MC accuracy \\
-Code & HumanEval+ & \texttt{evalplus} package & 164 & pass@1 \\
-Summarization & XSum & \texttt{EdinburghNLP/xsum} & 500 & ROUGE + BERTScore \\
-Instruction & IFEval & \texttt{google/IFEval} & $\sim$500 & Strict/loose accuracy \\
-Vision + Math & MathVista & \texttt{AI4Math/MathVista} & 500 & Accuracy \\
+Math (easy) & GSM8K & \texttt{openai/gsm8k} & 500 & Exact match & \citet{cobbe2021gsm8k} \\
+Math (hard) & MATH-500 & \texttt{HF/MATH-500} & 500 & Exact match & \citet{hendrycks2021math} \\
+Knowledge QA & MMLU-Pro & \texttt{TIGER/MMLU-Pro} & 500 & MC accuracy & \citet{wang2024mmlupro} \\
+Code & HumanEval+ & \texttt{evalplus} & 164 & pass@1 & \citet{chen2021humaneval} \\
+Summarization & XSum & \texttt{EdNLP/xsum} & 500 & ROUGE+BERTScore & --- \\
+Instruction & IFEval & \texttt{google/IFEval} & $\sim$500 & Strict/loose acc & \citet{zhou2023ifeval} \\
+Vision+Math & MathVista & \texttt{AI4Math/MathVista} & 500 & Accuracy & \citet{lu2024mathvista} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Rationale for selection.} This benchmark set is designed to produce a clean narrative arc across task types:
-\begin{itemize}[nosep]
-    \item \textbf{Tasks expected to strongly benefit from reasoning}: MATH-500 (competition-level math), HumanEval+ (code generation requiring planning), MathVista (vision + mathematical reasoning).
-    \item \textbf{Tasks with expected diminishing returns}: GSM8K (grade-school math, may saturate quickly), MMLU-Pro (knowledge QA where reasoning has moderate benefit).
-    \item \textbf{Tasks where reasoning may be unnecessary or harmful}: XSum (summarization, primarily extractive), IFEval (instruction following, simple constraint checking).
-\end{itemize}
-
-For MMLU-Pro, we use stratified sampling across all 14 domains to ensure representativeness. For MathVista, we use the \texttt{testmini} split (1,000 examples with public labels) and sample 500.
+This benchmark set produces a clean narrative arc: tasks expected to strongly benefit from reasoning (MATH-500, HumanEval+, MathVista), tasks with diminishing returns (GSM8K, MMLU-Pro), and tasks where reasoning may be unnecessary or harmful (XSum, IFEval).
 
 % ------------------------------------------------------------
 \subsection{Reasoning Budget Control}
 % ------------------------------------------------------------
 
 For each task and model, we evaluate seven reasoning token budget levels:
-
 \begin{equation}
     t \in \{0, 64, 256, 1024, 2048, 4096, 8192\}
 \end{equation}
+where $t = 0$ corresponds to thinking disabled (\texttt{enable\_thinking=False}) and $t > 0$ corresponds to thinking enabled with budget forcing.
 
-where $t = 0$ corresponds to thinking disabled entirely (\texttt{enable\_thinking=False}) and $t > 0$ corresponds to thinking enabled with budget forcing at $t$ tokens.
-
-\textbf{Budget forcing implementation.} We adopt a LogitsProcessor-based approach following \citet{muennighoff2025s1}:
-
+\textbf{Budget forcing implementation} (following \citealt{muennighoff2025s1}):
 \begin{enumerate}[nosep]
     \item Enable thinking mode (\texttt{enable\_thinking=True}).
-    \item Track the token count inside \texttt{<think>...</think>} during generation.
-    \item At $t - 1$ tokens: suppress all tokens except the newline character.
-    \item At $t$ tokens: force the \texttt{</think>} token (token ID 248069 for Qwen3.5).
+    \item Track the token count inside \texttt{<think>...</think>}.
+    \item At $t - 1$ tokens: suppress all tokens except newline.
+    \item At $t$ tokens: force the \texttt{</think>} token (token ID 248069).
     \item Continue generation normally for the final answer.
 \end{enumerate}
-
-This ensures a graceful transition from thinking to answering, rather than abrupt truncation mid-sentence.
 
 % ------------------------------------------------------------
 \subsection{Inference Configuration}
 % ------------------------------------------------------------
-
-We serve models using vLLM with the following configuration:
 
 \begin{lstlisting}
 vllm serve Qwen/Qwen3.5-{size} --port 8000 \
@@ -220,55 +212,127 @@ vllm serve Qwen/Qwen3.5-{size} --port 8000 \
   --max-model-len 32768
 \end{lstlisting}
 
-\textbf{Sampling parameters.} For thinking mode: temperature $= 0.6$, top-$p = 0.95$, top-$k = 20$. For non-thinking mode ($t = 0$): temperature $= 0.7$, top-$p = 0.8$, top-$k = 20$. Greedy decoding is avoided with thinking mode enabled, as it causes infinite repetition loops in Qwen3.5 models.
+Sampling parameters (thinking mode): $T = 0.6$, top-$p = 0.95$, top-$k = 20$. Non-thinking: $T = 0.7$, top-$p = 0.8$, top-$k = 20$.
+
+% ------------------------------------------------------------
+\subsection{Mapping to Research Questions}
+% ------------------------------------------------------------
+
+Each experimental output explicitly maps to one or more of the four research questions defined in our proposal:
+
+\begin{table}[h]
+\centering
+\caption{Mapping of experimental outputs to research questions.}
+\label{tab:rq-mapping}
+\small
+\begin{tabular}{@{}p{1.2cm}p{4.5cm}p{8.3cm}@{}}
+\toprule
+\textbf{RQ} & \textbf{Question} & \textbf{How our experiments answer it} \\
+\midrule
+RQ1 & Is reasoning always beneficial? & Compare $\text{Acc}(t=0)$ vs.\ $\max_{t > 0} \text{Acc}(t)$ across all 7 benchmarks. Identify benchmarks where thinking provides no benefit or harms accuracy. \\
+\addlinespace
+RQ2 & How does Acc(t) vary across task types? & Plot full $\text{Acc}(t)$ curves for all 7 benchmarks. Categorize each as monotonic, inverted-U, flat, or declining. \\
+\addlinespace
+RQ3 & Does model size influence reasoning utility? & Compare curves across the 4 model sizes per task. Quantify ``slope'' and ``knee'' per (task, model) pair. \\
+\addlinespace
+RQ4 & Implications for workflow allocation? & Five concrete deliverables (\S\ref{sec:rq4}) translating curves into workflow design recommendations. \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ------------------------------------------------------------
 \subsection{Evaluation Methodology}
 % ------------------------------------------------------------
 
-\textbf{Math tasks (GSM8K, MATH-500).} We extract the final numerical answer from the model output and compare via exact match. For MATH-500, answers are expected in \LaTeX-boxed format.
+\textbf{Math (GSM8K, MATH-500):} Extract final answer (numerical or \LaTeX-boxed), exact match. \textbf{Knowledge QA (MMLU-Pro):} Accuracy over 10 answer choices. \textbf{Code (HumanEval+):} Sandboxed execution via \texttt{evalplus}, pass@1. \textbf{Summarization (XSum):} ROUGE-1/2/L plus BERTScore. \textbf{Instruction following (IFEval):} Programmatic constraint checker, strict and loose accuracy. \textbf{Vision+Math (MathVista):} Official evaluation script.
 
-\textbf{Knowledge QA (MMLU-Pro).} Multiple-choice accuracy over 10 answer choices (10\% random baseline).
+We report bootstrap 95\% confidence intervals. With 500 samples at $\sim$50\% accuracy, the 95\% CI is approximately $\pm$4.4 points; with 164 samples (HumanEval+) it is $\pm$7.7 points.
 
-\textbf{Code (HumanEval+).} We use the \texttt{evalplus} framework for sandboxed code execution with 80$\times$ augmented test cases. We report pass@1 with a single generation per problem.
+% ============================================================
+\section{RQ4 Analysis: Workflow Implications}
+\label{sec:rq4}
+% ============================================================
 
-\textbf{Summarization (XSum).} We report ROUGE-1, ROUGE-2, and ROUGE-L, supplemented by BERTScore to mitigate ROUGE's limitations as a purely n-gram-based metric.
-
-\textbf{Instruction following (IFEval).} We use the programmatic constraint checker provided with IFEval, reporting both strict accuracy (all constraints satisfied) and loose accuracy (partial credit).
-
-\textbf{Vision + Math (MathVista).} Accuracy via exact match for numerical answers and multiple-choice questions, using the official evaluation script.
+This section operationalizes RQ4 with five concrete deliverables that translate empirical accuracy--reasoning curves into actionable workflow design guidance.
 
 % ------------------------------------------------------------
-\subsection{Analysis Plan}
+\subsection{Deliverable 1: Reasoning Budget Recommendation Table}
 % ------------------------------------------------------------
 
-For each (model, benchmark) pair, we plot the \emph{accuracy--reasoning curve} $\text{Acc}(t)$, where $t$ is the reasoning token budget. We characterize each curve as one of:
+For each (task category, model size) pair, we will produce a recommendation table containing:
+\begin{itemize}[nosep]
+    \item Recommended thinking budget (token count or thinking mode: off/low/medium/high)
+    \item Accuracy at recommended budget with 95\% CI
+    \item Marginal accuracy loss if budget is halved or doubled
+    \item Token cost at recommended budget
+\end{itemize}
+This is directly usable by practitioners building Qwen3.5-based workflows. It fills the quantitative gap noted in industry agent guides \citep{anthropic2024agents,openai2025agents} which recommend per-node routing without quantitative thresholds.
+
+% ------------------------------------------------------------
+\subsection{Deliverable 2: Simulated Multi-Node Workflow Case Study}
+% ------------------------------------------------------------
+
+We will design 2--3 representative agentic workflows and simulate end-to-end performance under different per-node reasoning budget allocation strategies:
 
 \begin{itemize}[nosep]
-    \item \textbf{Monotonically increasing}: Task benefits from more reasoning at all budget levels.
-    \item \textbf{Inverted-U / saturating}: Task has an optimal reasoning budget beyond which performance plateaus or declines.
-    \item \textbf{Flat}: Task does not benefit from reasoning tokens.
-    \item \textbf{Declining}: Additional reasoning actively hurts performance.
+    \item \textbf{Workflow A (RAG)}: query classification $\rightarrow$ retrieval $\rightarrow$ synthesis $\rightarrow$ verification
+    \item \textbf{Workflow B (Coding agent)}: issue understanding $\rightarrow$ code localization $\rightarrow$ patch generation $\rightarrow$ test reasoning
+    \item \textbf{Workflow C (Research assistant)}: query decomposition $\rightarrow$ multi-hop QA $\rightarrow$ summarization
 \end{itemize}
 
-We perform cross-model analysis by comparing curve shapes across model sizes to address RQ3 (does model size influence reasoning utility?). We report bootstrap 95\% confidence intervals for all accuracy estimates.
+We compare three allocation strategies: (1) \emph{uniform}---same budget for all nodes (baseline); (2) \emph{curve-informed}---use our task-type curves to assign optimal per-node budgets; (3) \emph{cost-constrained Pareto}---given a fixed total token budget, derive the Pareto-optimal allocation. We expect curve-informed allocation to match uniform accuracy at lower cost, paralleling the LLMSelector methodology \citep{chen2025llmselector} but for reasoning budgets rather than model selection.
 
-\textbf{Statistical reliability.} With 500 samples and accuracy near 50\%, the 95\% confidence interval is approximately $\pm$4.4 percentage points. With 164 samples (HumanEval), it is $\pm$7.7 points.
+% ------------------------------------------------------------
+\subsection{Deliverable 3: Cost--Performance Pareto Frontier Analysis}
+% ------------------------------------------------------------
+
+For each task type and model size, we plot the Pareto frontier of accuracy vs.\ reasoning token cost, then compute:
+\begin{itemize}[nosep]
+    \item Cost savings at iso-accuracy
+    \item Accuracy gains at iso-cost
+    \item Break-even points where reasoning pays for itself
+\end{itemize}
+This connects directly to the AdaCoT \citep{lou2025adacot} and FrugalGPT \citep{chen2023frugalgpt} framings.
+
+% ------------------------------------------------------------
+\subsection{Deliverable 4: Decision Heuristics for Workflow Designers}
+% ------------------------------------------------------------
+
+We will derive simple, actionable rules from the curves, formatted as a decision tree mapping (task type, model size, cost constraint) to recommended budget. Examples of expected rules:
+\begin{itemize}[nosep]
+    \item ``For classification on Qwen3.5-\{size\}, disable thinking entirely ($\text{Acc}(0) \approx \text{Acc}(8192)$)''
+    \item ``For mathematical reasoning, allocate at least $N$ tokens; below this, accuracy drops by $X\%$''
+    \item ``Crossover point: a smaller model with large budget matches a larger model with small budget for task $T$ at budget $B$''
+\end{itemize}
+This addresses the qualitative gap in Anthropic's ``Building Effective Agents'' guide.
+
+% ------------------------------------------------------------
+\subsection{Deliverable 5: Reasoning Elasticity and Per-Task Scaling Laws}
+% ------------------------------------------------------------
+
+We define \emph{reasoning elasticity} as the percentage change in accuracy per percentage change in reasoning token budget, and fit functional forms (logarithmic, sigmoid) to the curves per (task type, model size). This enables:
+\begin{itemize}[nosep]
+    \item Extrapolation to budgets not directly tested
+    \item Comparison across model sizes (does elasticity change with scale?)
+    \item Predictive budgeting for new task types based on characteristics
+\end{itemize}
+This extends the test-time compute scaling laws \citep{snell2024scaling} by providing task-type-stratified relationships rather than aggregate ones.
 
 % ============================================================
 \section{Codebase Architecture}
 % ============================================================
 
-The project codebase is organized into four modules:
+The project codebase is organized into five modules:
 
 \begin{itemize}[nosep]
-    \item \textbf{Inference} (\texttt{src/inference/}): vLLM server management, OpenAI-compatible API client, and the budget forcing LogitsProcessor.
-    \item \textbf{Data} (\texttt{src/data/}): Unified dataset loader with per-benchmark prompt formatting and answer extraction modules.
-    \item \textbf{Evaluation} (\texttt{src/eval/}): Metric computation (exact match, ROUGE, BERTScore, pass@1) and task-specific judges (IFEval constraint checker, code execution sandbox).
-    \item \textbf{Analysis} (\texttt{src/analysis/}): Accuracy--reasoning curve plotting, model $\times$ task $\times$ budget heatmaps, and statistical analysis.
+    \item \textbf{Inference} (\texttt{src/inference/}): vLLM server management, OpenAI-compatible client, budget forcing LogitsProcessor.
+    \item \textbf{Data} (\texttt{src/data/}): Unified loader with per-benchmark prompt formatting.
+    \item \textbf{Eval} (\texttt{src/eval/}): Metric computation and task-specific judges.
+    \item \textbf{Analysis} (\texttt{src/analysis/}): Acc(t) curve plotting, heatmaps, statistical tests for RQ1--RQ3.
+    \item \textbf{Workflow} (\texttt{src/workflow/}): RQ4 deliverables --- recommendation table, multi-node simulator, Pareto analysis, decision rule extraction, elasticity fitting.
 \end{itemize}
 
-The main experiment loop iterates over models in the outer loop (to avoid reloading weights), benchmarks in the middle loop, and reasoning budgets in the inner loop. All raw outputs (thinking tokens + final answer) are saved for post-hoc qualitative analysis.
+The main loop iterates models in the outer loop (avoiding weight reloads), benchmarks in the middle loop, and reasoning budgets in the inner loop. All raw outputs (thinking tokens + final answer) are saved for post-hoc analysis.
 
 % ============================================================
 \section{Timeline}
@@ -282,19 +346,20 @@ The main experiment loop iterates over models in the outer loop (to avoid reload
 \toprule
 \textbf{Days} & \textbf{Phase} & \textbf{Work} \\
 \midrule
-1--2 & Setup & Provision H100, install vLLM, download models and datasets, verify end-to-end inference \\
-3--5 & Core code & Implement API client, budget forcing, all data loaders, all evaluation metrics. Smoke test each benchmark with 5 examples on 0.8B \\
-6--8 & Small models & Full experiment sweep on Qwen3.5-0.8B and Qwen3.5-4B \\
-9--11 & Medium model & Full sweep on Qwen3.5-9B. Begin preliminary analysis of small model results \\
-12--14 & Large model & Full sweep on Qwen3.5-27B (FP8). Slowest phase ($\sim$20--30 hrs GPU time) \\
-15--17 & Analysis & Generate all accuracy--reasoning curves, heatmaps, statistical tests \\
-18--19 & Write-up & Literature review, methodology, results with figures \\
-20 & Buffer & Re-run failed experiments, polish, final submission \\
+1--2 & Setup & Provision H100, install vLLM, download models and datasets, smoke test \\
+3--5 & Core code & Client, budget forcing, all data loaders, all evaluation metrics \\
+6--8 & Small models & Full sweep on Qwen3.5-0.8B and Qwen3.5-4B \\
+9--11 & Medium model & Full sweep on Qwen3.5-9B. Begin RQ1--RQ3 analysis on small-model results \\
+12--14 & Large model & Full sweep on Qwen3.5-27B (FP8) \\
+15--16 & RQ1--RQ3 analysis & Curves, heatmaps, characterize per-task curve shapes \\
+17--18 & RQ4 analysis & Recommendation table, workflow simulations, Pareto, heuristics, elasticity \\
+19 & Write-up & Lit review, methodology, results, RQ4 implications \\
+20 & Buffer & Re-runs, polish, final submission \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Compute estimate.} Approximately 3,500 examples $\times$ 7 budgets $\times$ 4 models $= \sim$98,000 inference calls. Estimated total GPU time: 4--5 days of continuous computation on a single H100.
+\textbf{Compute estimate:} Approximately 3,500 examples $\times$ 7 budgets $\times$ 4 models = $\sim$98,000 inference calls. Estimated total GPU time: 4--5 days continuous on a single H100.
 
 % ============================================================
 \section{Risks and Mitigations}
@@ -302,18 +367,19 @@ The main experiment loop iterates over models in the outer loop (to avoid reload
 
 \begin{table}[h]
 \centering
-\caption{Identified risks and mitigation strategies.}
+\caption{Risks and mitigations.}
 \label{tab:risks}
 \begin{tabular}{@{}p{5.5cm}p{8.5cm}@{}}
 \toprule
 \textbf{Risk} & \textbf{Mitigation} \\
 \midrule
-27B model too slow or out-of-memory & Fall back to 9B as largest model, or substitute Qwen3.5-35B-A3B (MoE with only 3B active parameters) \\
-Budget forcing degrades output quality & Test early (day 3). If hard truncation fails, record natural token counts instead of forcing \\
-Summarization metrics are noisy & Use both ROUGE and BERTScore. Acknowledge ROUGE limitations in write-up \\
-Code evaluation requires sandboxing & Use the \texttt{evalplus} package which provides built-in sandboxed execution \\
-Small models score near zero on hard benchmarks & This is itself a finding: small models cannot leverage reasoning tokens effectively \\
-Data contamination & Within-model comparison controls for contamination, as all budget conditions share the same training data \\
+27B model too slow or OOM & Fall back to 9B as largest, or substitute Qwen3.5-35B-A3B (MoE, only 3B active) \\
+Budget forcing degrades quality & Test early (day 3). If hard truncation fails, record natural token counts \\
+Summarization metrics noisy & Use ROUGE + BERTScore. Acknowledge limitations \\
+Code eval requires sandboxing & Use \texttt{evalplus} package \\
+Small models score $\sim$0 on hard benchmarks & Itself a finding: small models cannot leverage reasoning effectively \\
+Data contamination & Within-model comparison controls for it across budget conditions \\
+RQ4 simulations not ``real'' workflows & Frame as design exercise; emphasize the recommendation table as the primary RQ4 output \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -323,9 +389,9 @@ Data contamination & Within-model comparison controls for contamination, as all 
 % ============================================================
 \bibliographystyle{plainnat}
 
-\begin{thebibliography}{30}
+\begin{thebibliography}{50}
 
-\bibitem[Aggarwal et~al.(2025a)]{aggarwal2025optimal}
+\bibitem[Aggarwal et~al.(2025)]{aggarwal2025optimal}
 P.~Aggarwal, S.~Kim, J.~Lanchantin, S.~Welleck, J.~Weston, I.~Kulikov, and S.~Saha.
 \newblock Optimalthinkingbench: Evaluating over and underthinking in {LLMs}.
 \newblock \emph{arXiv preprint arXiv:2508.13141}, 2025.
@@ -340,10 +406,59 @@ M.~A. Alomrani et~al.
 \newblock Reasoning on a budget: A survey of adaptive and controllable test-time compute in {LLMs}.
 \newblock \emph{arXiv preprint arXiv:2507.02076}, 2025.
 
+\bibitem[Anthropic(2024)]{anthropic2024agents}
+Anthropic.
+\newblock Building effective agents.
+\newblock \url{https://www.anthropic.com/research/building-effective-agents}, 2024.
+
+\bibitem[Art of Scaling(2025)]{artofscaling2025}
+The art of scaling test-time compute for large language models.
+\newblock \emph{arXiv preprint arXiv:2512.02008}, 2025.
+
+\bibitem[Bansal et~al.(2024)]{bansal2024empirical}
+S.~Bansal et~al.
+\newblock An empirical analysis of compute-optimal inference for problem-solving with language models.
+\newblock \emph{arXiv preprint arXiv:2408.00724}, 2024.
+
+\bibitem[Chen et~al.(2021)]{chen2021humaneval}
+M.~Chen et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Chen et~al.(2023)]{chen2023frugalgpt}
+L.~Chen, M.~Zaharia, and J.~Zou.
+\newblock {FrugalGPT}: How to use large language models while reducing cost and improving performance.
+\newblock \emph{arXiv preprint arXiv:2305.05176}, 2023.
+
+\bibitem[Chen et~al.(2025)]{chen2025llmselector}
+L.~Chen, J.~Q. Davis, B.~Hanin, P.~Bailis, M.~Zaharia, J.~Zou, and I.~Stoica.
+\newblock Optimizing model selection for compound {AI} systems.
+\newblock \emph{arXiv preprint arXiv:2502.14815}, 2025.
+
+\bibitem[Cobbe et~al.(2021)]{cobbe2021gsm8k}
+K.~Cobbe et~al.
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[Damani et~al.(2024)]{damani2024learning}
+M.~Damani, I.~Shenfeld, A.~Peng, A.~Bobu, and J.~Andreas.
+\newblock Learning how hard to think: Input-adaptive allocation of {LM} computation.
+\newblock \emph{arXiv preprint arXiv:2410.04707}, 2024.
+
 \bibitem[DeepSeek-AI(2025)]{deepseek2025r1}
 DeepSeek-AI.
 \newblock {DeepSeek-R1}: Incentivizing reasoning capability in {LLMs} via reinforcement learning.
 \newblock \emph{arXiv preprint arXiv:2501.12948}, 2025.
+
+\bibitem[Ding et~al.(2024)]{ding2024hybrid}
+D.~Ding and A.~Mallick.
+\newblock Hybrid {LLM}: Cost-efficient and quality-aware query routing.
+\newblock \emph{arXiv preprint arXiv:2404.14618}, 2024.
+
+\bibitem[Fourney et~al.(2024)]{fourney2024magentic}
+A.~Fourney, G.~Bansal, H.~Mozannar, et~al.
+\newblock Magentic-one: A generalist multi-agent system for solving complex tasks.
+\newblock \emph{arXiv preprint arXiv:2411.04468}, 2024.
 
 \bibitem[Han et~al.(2025)]{han2025token}
 T.~Han, Z.~Wang, et~al.
@@ -355,6 +470,31 @@ M.~Hassid et~al.
 \newblock Don't overthink it. Preferring shorter thinking chains for improved {LLM} reasoning.
 \newblock \emph{arXiv preprint arXiv:2505.17813}, 2025.
 
+\bibitem[Hendrycks et~al.(2021)]{hendrycks2021math}
+D.~Hendrycks et~al.
+\newblock Measuring mathematical problem solving with the {MATH} dataset.
+\newblock \emph{arXiv preprint arXiv:2103.03874}, 2021.
+
+\bibitem[Kambhampati(2024)]{kambhampati2024reason}
+S.~Kambhampati.
+\newblock Can {LLMs} really reason and plan?
+\newblock \emph{arXiv preprint arXiv:2405.13515}, 2024.
+
+\bibitem[Khattab et~al.(2023)]{khattab2023dspy}
+O.~Khattab, A.~Singhvi, et~al.
+\newblock {DSPy}: Compiling declarative language model calls into self-improving pipelines.
+\newblock \emph{arXiv preprint arXiv:2310.03714}, 2023.
+
+\bibitem[Kim et~al.(2026)]{kim2026hpca}
+G.~Kim, S.~Shin, J.~Chung, and M.~Rhu.
+\newblock The cost of dynamic reasoning: Demystifying {AI} agents and test-time scaling from an {AI} infrastructure perspective.
+\newblock \emph{arXiv preprint arXiv:2506.04301} (HPCA 2026), 2025.
+
+\bibitem[Kimi Team(2025)]{kimi2025k15}
+Kimi Team.
+\newblock Kimi {K1.5}: Scaling reinforcement learning with {LLMs}.
+\newblock \emph{arXiv preprint arXiv:2501.12599}, 2025.
+
 \bibitem[Kojima et~al.(2022)]{kojima2022large}
 T.~Kojima, S.~S. Gu, M.~Reid, Y.~Matsuo, and Y.~Iwasawa.
 \newblock Large language models are zero-shot reasoners.
@@ -365,10 +505,30 @@ J.~Li, W.~Zhao, Y.~Zhang, and C.~Gan.
 \newblock Steering {LLM} thinking with budget guidance.
 \newblock \emph{arXiv preprint arXiv:2506.13752}, 2025.
 
+\bibitem[Lightman et~al.(2023)]{lightman2023verify}
+H.~Lightman et~al.
+\newblock Let's verify step by step.
+\newblock \emph{arXiv preprint arXiv:2305.20050}, 2023.
+
 \bibitem[Liu et~al.(2025)]{liu2025diffadapt}
 X.~Liu et~al.
 \newblock {DiffAdapt}: Difficulty-adaptive reasoning for token-efficient {LLM} inference.
 \newblock \emph{arXiv preprint arXiv:2510.19669}, 2025.
+
+\bibitem[Lou et~al.(2025)]{lou2025adacot}
+C.~Lou et~al.
+\newblock {AdaCoT}: Pareto-optimal adaptive chain-of-thought triggering via reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2505.11896}, 2025.
+
+\bibitem[Lu et~al.(2024)]{lu2024mathvista}
+P.~Lu et~al.
+\newblock {MathVista}: Evaluating mathematical reasoning of foundation models in visual contexts.
+\newblock \emph{arXiv preprint arXiv:2310.02255}, 2024.
+
+\bibitem[Madaan et~al.(2023)]{madaan2023selfrefine}
+A.~Madaan, N.~Tandon, et~al.
+\newblock Self-refine: Iterative refinement with self-feedback.
+\newblock \emph{arXiv preprint arXiv:2303.17651}, 2023.
 
 \bibitem[Marjanovic et~al.(2025)]{marjanovic2025thoughtology}
 S.~V. Marjanovic et~al.
@@ -377,46 +537,131 @@ S.~V. Marjanovic et~al.
 
 \bibitem[Meincke et~al.(2025)]{meincke2025decreasing}
 L.~Meincke, E.~R. Mollick, L.~Mollick, and D.~Shapiro.
-\newblock Prompting science report 2: The decreasing value of chain of thought in prompting.
+\newblock The decreasing value of chain of thought in prompting.
 \newblock \emph{arXiv preprint arXiv:2506.07142}, 2025.
+
+\bibitem[Microsoft(2025)]{microsoft2025phi4}
+Microsoft Research.
+\newblock {Phi-4-reasoning} technical report.
+\newblock \emph{arXiv preprint arXiv:2504.21318}, 2025.
+
+\bibitem[Mirzadeh et~al.(2024)]{mirzadeh2024gsmsymbolic}
+I.~Mirzadeh et~al.
+\newblock {GSM-Symbolic}: Understanding the limitations of mathematical reasoning in large language models.
+\newblock \emph{arXiv preprint arXiv:2410.05229}, 2024.
 
 \bibitem[Muennighoff et~al.(2025)]{muennighoff2025s1}
 N.~Muennighoff et~al.
 \newblock s1: Simple test-time scaling.
 \newblock \emph{arXiv preprint arXiv:2501.19393}, 2025.
 
+\bibitem[Ong et~al.(2024)]{ong2024routellm}
+I.~Ong, A.~Almahairi, V.~Wu, et~al.
+\newblock {RouteLLM}: Learning to route {LLMs} with preference data.
+\newblock \emph{arXiv preprint arXiv:2406.18665}, 2024.
+
 \bibitem[OpenAI(2024)]{openai2024reasoning}
 OpenAI.
 \newblock Learning to reason with {LLMs}.
 \newblock \url{https://openai.com/index/learning-to-reason-with-llms/}, 2024.
+
+\bibitem[OpenAI(2025)]{openai2025agents}
+OpenAI.
+\newblock A practical guide to building agents.
+\newblock \url{https://openai.com/business/guides-and-resources/a-practical-guide-to-building-ai-agents/}, 2025.
+
+\bibitem[Paglieri et~al.(2025)]{paglieri2025whentoplan}
+D.~Paglieri et~al.
+\newblock Learning when to plan: Efficiently allocating test-time compute for {LLM} agents.
+\newblock \emph{arXiv preprint arXiv:2509.03581}, 2025.
+
+\bibitem[Rein et~al.(2023)]{rein2023gpqa}
+D.~Rein et~al.
+\newblock {GPQA}: A graduate-level google-proof {Q}\&{A} benchmark.
+\newblock \emph{arXiv preprint arXiv:2311.12022}, 2023.
+
+\bibitem[Shinn et~al.(2023)]{shinn2023reflexion}
+N.~Shinn, F.~Cassano, et~al.
+\newblock Reflexion: Language agents with verbal reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2303.11366}, 2023.
 
 \bibitem[Snell et~al.(2024)]{snell2024scaling}
 C.~Snell, J.~Lee, K.~Xu, and A.~Kumar.
 \newblock Scaling {LLM} test-time compute optimally can be more effective than scaling model parameters.
 \newblock \emph{arXiv preprint arXiv:2408.03314}, 2024.
 
-\bibitem[Su et~al.(2025)]{su2025between}
+\bibitem[Su et~al.(2025a)]{su2025between}
 J.~Su, J.~Healey, P.~Nakov, and C.~Cardie.
 \newblock Between underthinking and overthinking: An empirical study of reasoning length and correctness in {LLMs}.
 \newblock \emph{arXiv preprint arXiv:2505.00127}, 2025.
+
+\bibitem[Su et~al.(2025b)]{su2025daao}
+J.~Su, Q.~Lan, et~al.
+\newblock Difficulty-aware agentic orchestration for query-specific multi-agent workflows.
+\newblock \emph{arXiv preprint arXiv:2509.11079}, 2025.
 
 \bibitem[Sui et~al.(2025)]{sui2025stop}
 Y.~Sui et~al.
 \newblock Stop overthinking: A survey on efficient reasoning for large language models.
 \newblock \emph{arXiv preprint arXiv:2503.16419}, 2025.
 
+\bibitem[Suzgun et~al.(2023)]{suzgun2023bbh}
+M.~Suzgun et~al.
+\newblock Challenging {BIG-Bench} tasks and whether chain-of-thought can solve them.
+\newblock \emph{arXiv preprint arXiv:2210.09261}, 2023.
+
 \bibitem[Wang et~al.(2023)]{wang2023self}
 X.~Wang, J.~Wei, D.~Schuurmans, Q.~Le, E.~Chi, S.~Narang, A.~Chowdhery, and D.~Zhou.
 \newblock Self-consistency improves chain of thought reasoning in language models.
 \newblock In \emph{ICLR}, 2023.
+
+\bibitem[Wang and Zhou(2024)]{wang2024cotwithout}
+X.~Wang and D.~Zhou.
+\newblock Chain-of-thought reasoning without prompting.
+\newblock \emph{arXiv preprint arXiv:2402.10200}, 2024.
+
+\bibitem[Wang et~al.(2024a)]{wang2024mathshepherd}
+P.~Wang et~al.
+\newblock Math-shepherd: Verify and reinforce {LLMs} step-by-step without human annotations.
+\newblock \emph{arXiv preprint arXiv:2312.08935}, 2024.
+
+\bibitem[Wang et~al.(2024b)]{wang2024mmlupro}
+Y.~Wang et~al.
+\newblock {MMLU-Pro}: A more robust and challenging multi-task language understanding benchmark.
+\newblock \emph{arXiv preprint arXiv:2406.01574}, 2024.
+
+\bibitem[Wang et~al.(2024c)]{wang2024moa}
+J.~Wang, J.~Wang, B.~Athiwaratkun, C.~Zhang, and J.~Zou.
+\newblock Mixture-of-agents enhances large language model capabilities.
+\newblock \emph{arXiv preprint arXiv:2406.04692}, 2024.
+
+\bibitem[Wang et~al.(2025)]{wang2025nowait}
+C.~Wang, Y.~Feng, D.~Chen, et~al.
+\newblock Wait, we don't need to ``{Wait}''! Removing thinking tokens improves reasoning efficiency.
+\newblock \emph{arXiv preprint arXiv:2506.08343}, 2025.
 
 \bibitem[Wei et~al.(2022)]{wei2022chain}
 J.~Wei, X.~Wang, D.~Schuurmans, M.~Bosma, B.~Ichter, F.~Xia, E.~Chi, Q.~Le, and D.~Zhou.
 \newblock Chain-of-thought prompting elicits reasoning in large language models.
 \newblock In \emph{NeurIPS}, 2022.
 
+\bibitem[Wen et~al.(2025)]{wen2025budgetthinker}
+H.~Wen et~al.
+\newblock {BudgetThinker}: Empowering budget-aware {LLM} reasoning with control tokens.
+\newblock \emph{arXiv preprint arXiv:2508.17196}, 2025.
+
+\bibitem[Wu et~al.(2023)]{wu2023autogen}
+Q.~Wu, G.~Bansal, J.~Zhang, et~al.
+\newblock {AutoGen}: Enabling next-gen {LLM} applications via multi-agent conversation.
+\newblock \emph{arXiv preprint arXiv:2308.08155}, 2023.
+
+\bibitem[Xu et~al.(2024)]{xu2024llavacot}
+G.~Xu et~al.
+\newblock {LLaVA-CoT}: Let vision language models reason step-by-step.
+\newblock \emph{arXiv preprint arXiv:2411.10440}, 2024.
+
 \bibitem[Yang et~al.(2025a)]{yang2025qwen3}
-A.~Yang, A.~Li, B.~Yang, B.~Zhang, et~al.
+A.~Yang et~al.
 \newblock Qwen3 technical report.
 \newblock \emph{arXiv preprint arXiv:2505.09388}, 2025.
 
@@ -430,20 +675,45 @@ Y.~Yang et~al.
 \newblock Does thinking more always help? Mirage of test-time scaling in reasoning models.
 \newblock \emph{arXiv preprint arXiv:2506.04210}, 2025.
 
+\bibitem[Yao et~al.(2022)]{yao2022react}
+S.~Yao, J.~Zhao, D.~Yu, et~al.
+\newblock {ReAct}: Synergizing reasoning and acting in language models.
+\newblock \emph{arXiv preprint arXiv:2210.03629}, 2022.
+
+\bibitem[Yao et~al.(2023)]{yao2023tot}
+S.~Yao, D.~Yu, et~al.
+\newblock Tree of thoughts: Deliberate problem solving with large language models.
+\newblock \emph{arXiv preprint arXiv:2305.10601}, 2023.
+
 \bibitem[Yeo et~al.(2025)]{yeo2025demystifying}
 E.~Yeo, Y.~Tong, M.~Niu, G.~Neubig, and X.~Yue.
 \newblock Demystifying long chain-of-thought reasoning in {LLMs}.
 \newblock \emph{arXiv preprint arXiv:2502.03373}, 2025.
 
-\bibitem[Zhang et~al.(2025)]{zhang2025structural}
+\bibitem[Zaharia et~al.(2024)]{zaharia2024compound}
+M.~Zaharia, O.~Khattab, L.~Chen, et~al.
+\newblock The shift from models to compound {AI} systems.
+\newblock \url{https://bair.berkeley.edu/blog/2024/02/18/compound-ai-systems/}, 2024.
+
+\bibitem[Zhang et~al.(2025a)]{zhang2025adaptthink}
+J.~Zhang, N.~Lin, L.~Hou, L.~Feng, and J.~Li.
+\newblock {AdaptThink}: Reasoning models can learn when to think.
+\newblock \emph{arXiv preprint arXiv:2505.13417}, 2025.
+
+\bibitem[Zhang et~al.(2025b)]{zhang2025structural}
 X.~F. Zhang et~al.
-\newblock Do {LLMs} really need 10+ thoughts for ``find the time 1000 days later''? Towards structural understanding of {LLM} overthinking.
+\newblock Towards structural understanding of {LLM} overthinking.
 \newblock \emph{arXiv preprint arXiv:2510.07880}, 2025.
 
 \bibitem[Zhao et~al.(2025)]{zhao2025knowledge}
 J.~X. Zhao, B.~Hooi, and S.-K. Ng.
 \newblock Test-time scaling in reasoning models is not effective for knowledge-intensive tasks yet.
 \newblock \emph{arXiv preprint arXiv:2509.06861}, 2025.
+
+\bibitem[Zhou et~al.(2023)]{zhou2023ifeval}
+J.~Zhou et~al.
+\newblock Instruction-following evaluation for large language models.
+\newblock \emph{arXiv preprint arXiv:2311.07911}, 2023.
 
 \end{thebibliography}
 
